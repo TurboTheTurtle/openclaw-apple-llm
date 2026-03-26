@@ -15,8 +15,8 @@ Ollama keeps models resident in RAM (3-4GB+). Apple's Foundation Models use the 
 ## Install
 
 ```bash
-git clone https://github.com/youruser/apple-llm.git
-cd apple-llm
+git clone https://github.com/TurboTheTurtle/openclaw-apple-llm.git
+cd openclaw-apple-llm
 make install    # builds release + symlinks to /usr/local/bin
 ```
 
