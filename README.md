@@ -114,13 +114,14 @@ Head-to-head comparison on Mac mini M4, macOS 26.4. Ollama running `llama3.2:3b`
 
 ### Latency & Throughput
 
-| Test | apple-llm | Ollama (llama3.2:3b) | Diff |
+| Test | apple-llm (~3B) | Ollama llama3.2 (3B) | Ollama llama3.1 (8B) |
 |---|---|---|---|
-| **Short prompt** ("What is 2+2?") | 0.30s | 0.42s | 1.4x faster |
-| **Medium response** (~120 words) | 2.93s | 4.84s | 1.7x faster |
-| **Longer response** (~350 words) | 6.42s | 9.70s | 1.5x faster |
-| **JSON/API mode** (short prompt) | 0.31s | 0.41s | 1.3x faster |
-| **Throughput** (longer response) | ~55 words/s | ~35 words/s | 1.6x faster |
+| **Short prompt** ("What is 2+2?") | **0.30s** | 0.42s | 0.61s |
+| **Medium response** (~120 words) | **2.93s** | 4.84s | 14.08s |
+| **Longer response** (~350 words) | **5.65s** | 9.70s | 18.90s |
+| **Throughput** (longer response) | **~55 w/s** | ~35 w/s | ~17 w/s |
+
+The 8B model is 3x slower than apple-llm on this machine due to memory pressure (4.3GB model on a 16GB system with ~5-8GB available).
 
 ### Memory
 
@@ -142,24 +143,41 @@ These two tools manage memory very differently. Per-process RSS (`ps`) doesn't t
 
 ### Model Quality
 
-Both models are ~3B parameters. We ran identical prompts through each for tasks typical of OpenClaw cron jobs.
+We ran identical prompts through three models for tasks typical of OpenClaw cron jobs:
 
-| Test | apple-llm (Apple FM) | Ollama (llama3.2:3b) |
-|---|---|---|
-| **Summarize JSON** | Correct, listed all services | Correct, grouped by status |
-| **Extract action items** | Got 2 of 3 items | Got all 3 (caught a dependency) |
-| **Classify error log** | "network" (debatable) | "application" (debatable) |
-| **Format for Slack** | Clean one-liner with emoji | Multi-line with hashtags |
-| **JSON extraction** | Found both unhealthy containers | Missed one (returned 1 of 2) |
-| **Disk usage reasoning** | Correct, slightly verbose | Correct, concise |
+| Test | apple-llm (Apple FM ~3B) | Ollama llama3.2 (3B) | Ollama llama3.1 (8B) |
+|---|---|---|---|
+| **Summarize JSON** | Correct, listed all services | Correct, grouped by status | Correct |
+| **Extract action items** | Got 2 of 3 | Got 3 of 3 | Got 3 of 3 |
+| **Classify error log** | "network" (wrong) | "application" (wrong) | **"database" (correct)** |
+| **Format for Slack** | Clean one-liner | Verbose with hashtags | Clean one-liner |
+| **JSON extraction** | Both correct, but markdown-wrapped | Missed one container | **Both correct, clean JSON** |
+| **Disk usage reasoning** | Wrong ("not concerned" at 90%) | Correct | Correct |
 
-**Verdict:** Roughly comparable quality. Ollama's llama3.2 is slightly better at following complex instructions (action item extraction). Apple's model is slightly better at structured extraction and concise formatting. Both struggle with precise classification. For OpenClaw cron job tasks — summarization, formatting, triage — either model works fine.
+**Verdict:** The 8B model is noticeably better — nails classification, produces clean JSON, and follows instructions more precisely. The two 3B models (Apple FM and llama3.2) are roughly comparable, trading wins depending on the task. For OpenClaw cron jobs, apple-llm handles summarization and formatting well; tasks requiring precise structured output or classification would benefit from a larger model.
 
 ### Why apple-llm on a Mac mini
 
-On a 16GB Mac mini running OpenClaw, Docker containers, Plex, Scrypted, and other services, baseline memory usage is ~8.7GB, leaving ~5.4GB available. Running Ollama with llama3.2:3b consumes 2.3GB of that — 40% of available memory, leaving little headroom for spikes.
+Real-world memory budget on a 16GB Mac mini M4 running OpenClaw, Plex, Scrypted, AdGuard, and other home lab services:
 
-apple-llm uses ~860MB of OS-managed (reclaimable) system memory during inference and frees it after. For a memory-constrained home lab, that's the difference between comfortable headroom and swap pressure.
+| Scenario | Baseline used | Available for inference |
+|---|---|---|
+| **Headless** (normal operation) | ~6 GB | **~8 GB** |
+| **With VS Code remote session** | ~8.7 GB | **~5.4 GB** |
+
+*Note: VS Code's remote server + language servers consume ~2.6GB when actively connected. This is transient — it's not running during cron jobs.*
+
+How each model fits into that budget:
+
+| Model | Memory cost | Fits headless? | Fits with VS Code? | Speed |
+|---|---|---|---|---|
+| **apple-llm** (Apple FM ~3B) | ~860 MB (reclaimable) | Yes, plenty | Yes, plenty | ~55 w/s |
+| **Ollama llama3.2** (3B) | 2.3 GB (pinned) | Yes | Yes, tight | ~35 w/s |
+| **Ollama llama3.1** (8B) | 4.3 GB (pinned) | Yes | Causes swap pressure | ~17 w/s |
+
+The 8B model is the best quality option, but on a 16GB Mac mini it's impractical during development sessions — 4.3GB pinned leaves almost nothing for spikes. In headless mode it fits, but runs 3x slower than apple-llm due to memory pressure.
+
+apple-llm is the sweet spot: good-enough quality for routine cron jobs, fastest inference, and minimal memory impact. For the occasional task that needs higher quality (precise classification, clean JSON), route it to a cloud API instead of paying the memory tax of a local 8B model.
 
 ## Security
 
