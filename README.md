@@ -140,6 +140,27 @@ These two tools manage memory very differently. Per-process RSS (`ps`) doesn't t
 - The apple-llm CLI process **exits immediately** after inference. Ollama's server stays resident.
 - Total system cost is roughly **2.5-3x less** than Ollama for a comparable 3B model, with the added benefit that the OS can reclaim the memory when needed.
 
+### Model Quality
+
+Both models are ~3B parameters. We ran identical prompts through each for tasks typical of OpenClaw cron jobs.
+
+| Test | apple-llm (Apple FM) | Ollama (llama3.2:3b) |
+|---|---|---|
+| **Summarize JSON** | Correct, listed all services | Correct, grouped by status |
+| **Extract action items** | Got 2 of 3 items | Got all 3 (caught a dependency) |
+| **Classify error log** | "network" (debatable) | "application" (debatable) |
+| **Format for Slack** | Clean one-liner with emoji | Multi-line with hashtags |
+| **JSON extraction** | Found both unhealthy containers | Missed one (returned 1 of 2) |
+| **Disk usage reasoning** | Correct, slightly verbose | Correct, concise |
+
+**Verdict:** Roughly comparable quality. Ollama's llama3.2 is slightly better at following complex instructions (action item extraction). Apple's model is slightly better at structured extraction and concise formatting. Both struggle with precise classification. For OpenClaw cron job tasks — summarization, formatting, triage — either model works fine.
+
+### Why apple-llm on a Mac mini
+
+On a 16GB Mac mini running OpenClaw, Docker containers, Plex, Scrypted, and other services, baseline memory usage is ~8.7GB, leaving ~5.4GB available. Running Ollama with llama3.2:3b consumes 2.3GB of that — 40% of available memory, leaving little headroom for spikes.
+
+apple-llm uses ~860MB of OS-managed (reclaimable) system memory during inference and frees it after. For a memory-constrained home lab, that's the difference between comfortable headroom and swap pressure.
+
 ## Security
 
 - **No network access** — all inference runs on-device, nothing leaves the machine
