@@ -1,9 +1,0 @@
-{
-  "id": "apple-llm",
-  "providers": ["apple"],
-  "configSchema": {
-    "type": "object",
-    "additionalProperties": false,
-    "properties": {}
-  }
-}

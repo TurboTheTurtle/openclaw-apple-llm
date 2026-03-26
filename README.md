@@ -1,27 +1,26 @@
-# openclaw-apple-llm
+# apple-llm
 
-An [OpenClaw](https://github.com/TurboTheTurtle/openclaw) plugin that bridges Apple's on-device Foundation Models (Apple Intelligence) to any application via stdin/stdout. Run cron jobs, format reports, triage logs, and summarize data — all using free, private, on-device inference instead of burning tokens on expensive cloud LLMs.
+A Swift CLI that bridges Apple's on-device Foundation Models (Apple Intelligence) to any application via stdin/stdout. Run scripts, cron jobs, and automation pipelines using free, private, on-device inference.
 
-No daemon, no HTTP server — load, infer, exit. Zero idle RAM cost.
+No daemon, no HTTP server -- load, infer, exit. Zero idle RAM cost.
 
 ## Why
 
-OpenClaw runs a multi-agent system with cron jobs, health checks, dashboard refreshes, and routine automation. Many of these tasks are simple — summarize some JSON, format a Slack message, classify a log line — and don't need a frontier model. Sending them to GPT-4 or Claude costs real money over time.
-
-Apple's Foundation Models run a ~3B parameter model on the Neural Engine with OS-level memory management. The model loads on demand and unloads automatically — zero idle cost. But there's no CLI or API to call it from non-Swift apps. This bridge fixes that.
+Apple's Foundation Models run a ~3B parameter model on the Neural Engine with OS-level memory management. The model loads on demand and unloads automatically. But there's no CLI or API to call it from non-Swift apps. This bridge fixes that.
 
 ### What it's good for
 
-- **Summarization** — health check results, API responses, cron output
-- **Formatting** — rewriting plain text into Slack messages, Apple Notes, reports
-- **Triage/classification** — routing error logs, categorizing alerts
-- **Simple Q&A** — quick lookups that don't need web search or deep reasoning
+- **Summarization** -- health check results, API responses, log output
+- **Formatting** -- rewriting plain text into Slack messages, reports, notes
+- **Triage/classification** -- routing error logs, categorizing alerts
+- **Simple Q&A** -- quick lookups that don't need web search or deep reasoning
 
 ### What it's not for
 
 - Code generation or complex reasoning (use a frontier model)
 - Precise structured output (the 3B model sometimes wraps JSON in markdown)
 - Tasks requiring up-to-date knowledge (no internet access)
+- Large context (see [Known Limitations](#known-limitations))
 
 ## Requirements
 
@@ -64,26 +63,18 @@ apple-llm --prompt "Hello" --no-stream
 
 ### JSON Mode
 
-For programmatic use and OpenClaw integration, use `--json` mode:
+For programmatic use in scripts and automation:
 
 ```bash
-# JSON input/output
+# JSON input/output via stdin
 echo '{"prompt":"What is 2+2?","max_tokens":100}' | apple-llm --json
 # => {"content":"2+2 equals 4.","model":"apple-foundation","tokens_used":null}
 
 # With system prompt and temperature
 echo '{"prompt":"Hello","system":"You are a pirate","temperature":1.5}' | apple-llm --json
-```
 
-### OpenClaw Integration
-
-OpenClaw spawns `apple-llm --json` as a child process — no server, no network surface:
-
-```bash
-# From a cron job or agent script
-RESULT=$(echo '{"prompt":"Summarize this health check: ...","max_tokens":200}' | apple-llm --json)
-
-# Parse with jq
+# In a shell script
+RESULT=$(echo '{"prompt":"Summarize: ...","max_tokens":200}' | apple-llm --json)
 CONTENT=$(echo "$RESULT" | jq -r '.content')
 ```
 
@@ -108,6 +99,15 @@ Errors go to stderr with exit code 1:
 apple-llm --prompt "" 2>/dev/null || echo "failed"
 ```
 
+## Known Limitations
+
+**Context window:** The on-device ~3B model has a hard context limit of approximately 4,500 tokens (~18,000 characters). Prompts exceeding this limit are rejected with an error. This means:
+- System prompt + user message + expected output must fit within ~18k characters total
+- Large documents need to be chunked or summarized before sending
+- Multi-turn conversations are not practical (no conversation history fits)
+
+For tasks that need larger context, use a cloud model or a local model via Ollama.
+
 ## Benchmarks
 
 Head-to-head comparison on Mac mini M4 (16GB), macOS 26.4. All Ollama models use default quantization (Q4_0/Q4_K_M). All times wall-clock, median of 3 runs. Nine models tested across three size classes: 3B, 7-9B, and 12-14B.
@@ -126,7 +126,7 @@ Head-to-head comparison on Mac mini M4 (16GB), macOS 26.4. All Ollama models use
 | Ollama mistral-nemo (12B) | 1.73s | 16.53s | 26.69s | ~12 w/s |
 | Ollama phi3 (14B) | 9.58s | 30.90s | 45.81s | ~9 w/s |
 
-apple-llm remains the fastest by a wide margin thanks to Neural Engine acceleration. In the 7-9B class, qwen2.5 and llama3.1 are the fastest; gemma2:9b is slightly slower but produces more concise output. The 12-14B models are 2-5x slower than apple-llm and offer diminishing returns on this hardware.
+apple-llm remains the fastest by a wide margin thanks to Neural Engine acceleration.
 
 ### Memory
 
@@ -142,70 +142,49 @@ apple-llm remains the fastest by a wide margin thanks to Neural Engine accelerat
 | Ollama mistral-nemo (12B) | ~7,300 MB | ~2.7 GB |
 | Ollama phi3 (14B) | ~8,000 MB | ~2.0 GB |
 
-**How apple-llm works under the hood:** The CLI process (~19MB) is just an IPC client. It sends the prompt to Apple's Neural Engine daemons (`aned`, `aneuserd`), which are always-on system services (~11MB combined). The ~3B model weights are loaded by the OS onto the Neural Engine hardware — they don't appear in any process's RSS, but they do consume ~860MB of system memory on first load.
+**How apple-llm works under the hood:** The CLI process (~19MB) is just an IPC client. It sends the prompt to Apple's Neural Engine daemons (`aned`, `aneuserd`), which are always-on system services (~11MB combined). The ~3B model weights are loaded by the OS onto the Neural Engine hardware -- they don't appear in any process's RSS, but they do consume ~860MB of system memory on first load.
 
 **Key differences from Ollama:**
-- Apple's model memory is **OS-managed and reclaimable** — the system can evict it under memory pressure. Ollama's memory is pinned in userspace until its idle timeout (default 5 minutes).
+- Apple's model memory is **OS-managed and reclaimable** -- the system can evict it under memory pressure. Ollama's memory is pinned in userspace until its idle timeout (default 5 minutes).
 - The apple-llm CLI process **exits immediately** after inference. Ollama's server stays resident.
-- The 7B class models (mistral, qwen2.5, llama3.1) use 4.3-4.8GB — roughly **5x more** than apple-llm's system footprint and non-reclaimable.
+- The 7B class models (mistral, qwen2.5, llama3.1) use 4.3-4.8GB -- roughly **5x more** than apple-llm's system footprint and non-reclaimable.
 
 ### Model Quality
 
-We ran 6 identical prompts through all models for tasks typical of OpenClaw cron jobs: summarize JSON, extract action items, classify an error log, format a Slack message, extract JSON from structured data, and reason about disk usage.
+We ran 6 identical prompts through all models for typical automation tasks: summarize JSON, extract action items, classify an error log, format a Slack message, extract JSON from structured data, and reason about disk usage.
 
 | Test | apple-llm (~3B) | llama3.2 (3B) | phi3 (3.8B) | mistral (7B) | qwen2.5 (7B) | gemma2 (9B) | llama3.1 (8B) | mistral-nemo (12B) | phi3 (14B) |
 |---|---|---|---|---|---|---|---|---|---|
 | **Summarize JSON** | Correct | Correct | Correct | Correct | Correct | Correct | Correct | Correct | Correct |
 | **Extract action items** | 2 of 3 | 3 of 3 | 3 of 3 | 2 of 3 | 3 of 3 | 2 of 3 | 3 of 3 | 3 of 3 | 3 of 3 |
-| **Classify error** | "network" ✗ | "application" ✗ | **"database" ✓** | **"database" ✓** | "network" ✗ | **"database" ✓** | **"database" ✓** | **"database" ✓** | **"database" ✓** |
-| **Format for Slack** | Clean ✓ | Verbose ✗ | Inaccurate ✗ | Clean ✓ | Garbled ✗ | Clean ✓ | Clean ✓ | Clean ✓ | Wrong count ✗ |
-| **JSON extraction** | Correct, md-wrapped | Missed one | Correct, md-wrapped | **Clean JSON** ✓ | **Clean JSON** ✓ | **Clean JSON** ✓ | **Clean JSON** ✓ | **Clean JSON** ✓ | Verbose ✗ |
-| **Disk reasoning** | Wrong ✗ | Correct ✓ | Correct ✓ | Correct ✓ | Correct ✓ | Correct ✓ | Correct ✓ | Correct ✓ | Wrong ✗ |
+| **Classify error** | "network" x | "application" x | **"database"** | **"database"** | "network" x | **"database"** | **"database"** | **"database"** | **"database"** |
+| **Format for Slack** | Clean | Verbose x | Inaccurate x | Clean | Garbled x | Clean | Clean | Clean | Wrong count x |
+| **JSON extraction** | Correct, md-wrapped | Missed one | Correct, md-wrapped | **Clean JSON** | **Clean JSON** | **Clean JSON** | **Clean JSON** | **Clean JSON** | Verbose x |
+| **Disk reasoning** | Wrong x | Correct | Correct | Correct | Correct | Correct | Correct | Correct | Wrong x |
 | **Score** | 3/6 | 3/6 | 4/6 | 5/6 | 4/6 | **5/6** | **5/6** | **6/6** | 3/6 |
 
 **Key findings:**
-- **mistral-nemo:12b scored 6/6** — the only model to ace every task. Correct classification, clean JSON, concise Slack formatting, and sound reasoning.
-- **gemma2:9b, mistral:7b, and llama3.1:8b tied at 5/6** — all nail classification and produce clean JSON. gemma2 stands out for concise, well-structured output.
-- **phi3:14b was a disappointment at 3/6** — despite being the largest model, it hallucinated disk usage numbers, gave wrong Slack stats ("2/3" instead of "3/4"), and was verbose. Worst value: slowest, most RAM, mediocre quality.
-- The 3B class (apple-llm and llama3.2) reliably handles summarization and formatting but struggles with classification and structured output.
+- **mistral-nemo:12b scored 6/6** -- the only model to ace every task
+- **gemma2:9b, mistral:7b, and llama3.1:8b tied at 5/6** -- all nail classification and produce clean JSON
+- The 3B class (apple-llm and llama3.2) reliably handles summarization and formatting but struggles with classification and structured output
+- **phi3:14b was a disappointment at 3/6** -- despite being the largest model tested
 
-### Choosing a Local Fallback Model
+### Choosing a Local Model
 
-apple-llm handles the easy stuff — summarization, formatting, simple Q&A — at 55 w/s with near-zero memory cost. But for tasks that need precise classification, clean JSON, or careful reasoning, you want a fallback model. Here's what to pair it with on a 16GB Mac mini:
+apple-llm handles the easy stuff -- summarization, formatting, simple Q&A -- at 55 w/s with near-zero memory cost. For tasks needing precise classification, clean JSON, or careful reasoning, pair it with a larger model via Ollama:
 
 | Recommendation | Model | Why | Memory | Speed |
 |---|---|---|---|---|
-| **Best quality** | mistral-nemo:12b | Only model to score 6/6. Nails every task type. | 7.3 GB | ~12 w/s |
-| **Best balance** ⭐ | gemma2:9b | 5/6 quality, concise output, good structured data. Best quality-per-GB. | 6.8 GB | ~14 w/s |
-| **Budget pick** | mistral:7b | 5/6 quality, lower memory, clean JSON output. | 4.7 GB | ~16 w/s |
-
-**Our recommendation: gemma2:9b** as the default fallback. It scores the same as llama3.1:8b on quality but produces more concise, better-structured output. On a 16GB Mac mini with typical home lab services (~6GB baseline), it leaves ~3.2GB of headroom — tight but workable if Ollama isn't running 24/7.
-
-If memory is tight (running alongside heavy services), **mistral:7b** gives the same 5/6 quality with 2GB less RAM. If you can spare the memory and want the best possible quality, **mistral-nemo:12b** is the only model that aced every test.
-
-**Skip phi3:14b** — it's the slowest, hungriest model tested and scored worse than models half its size.
-
-### OpenClaw Routing Strategy
-
-For OpenClaw deployments, we recommend a two-tier approach:
-
-```
-Tier 1 (apple-llm): summarization, formatting, simple Q&A
-  → Fast (~55 w/s), free, zero idle cost
-
-Tier 2 (gemma2:9b via Ollama): classification, JSON extraction, reasoning
-  → Higher quality, load on demand
-```
-
-Start Ollama only when Tier 2 tasks arrive, stop after idle timeout. This keeps the Mac mini's memory free for other services most of the time while still having a high-quality local model available when needed.
+| **Best quality** | mistral-nemo:12b | Only model to score 6/6 | 7.3 GB | ~12 w/s |
+| **Best balance** | gemma2:9b | 5/6 quality, concise output, best quality-per-GB | 6.8 GB | ~14 w/s |
+| **Budget pick** | mistral:7b | 5/6 quality, lower memory, clean JSON | 4.7 GB | ~16 w/s |
 
 ## Security
 
-- **No network access** — all inference runs on-device, nothing leaves the machine
-- **No persistent state** — load, infer, exit. No files written, no config stored
-- **No secrets** — doesn't touch API keys, credentials, or user data
-- **Apple guardrails** — built-in content safety that cannot be disabled
-- **Direct spawn** — OpenClaw pipes JSON in/out via child process, no HTTP server or open ports
+- **No network access** -- all inference runs on-device, nothing leaves the machine
+- **No persistent state** -- load, infer, exit. No files written, no config stored
+- **No secrets** -- doesn't touch API keys, credentials, or user data
+- **Apple guardrails** -- built-in content safety that cannot be disabled
 
 ## License
 
