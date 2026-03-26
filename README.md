@@ -158,26 +158,15 @@ We ran identical prompts through three models for tasks typical of OpenClaw cron
 
 ### Why apple-llm on a Mac mini
 
-Real-world memory budget on a 16GB Mac mini M4 running OpenClaw, Plex, Scrypted, AdGuard, and other home lab services:
+Real-world memory budget on a 16GB Mac mini M4 running OpenClaw, Plex, Scrypted, AdGuard, and other home lab services: baseline usage is ~6GB, leaving **~8GB available** for inference.
 
-| Scenario | Baseline used | Available for inference |
-|---|---|---|
-| **Headless** (normal operation) | ~6 GB | **~8 GB** |
-| **With VS Code remote session** | ~8.7 GB | **~5.4 GB** |
+| Model | Memory cost | Headroom left | Speed |
+|---|---|---|---|
+| **apple-llm** (Apple FM ~3B) | ~860 MB (reclaimable) | ~7 GB | ~55 w/s |
+| **Ollama llama3.2** (3B) | 2.3 GB (pinned) | ~5.7 GB | ~35 w/s |
+| **Ollama llama3.1** (8B) | 4.3 GB (pinned) | ~3.7 GB | ~17 w/s |
 
-*Note: VS Code's remote server + language servers consume ~2.6GB when actively connected. This is transient — it's not running during cron jobs.*
-
-How each model fits into that budget:
-
-| Model | Memory cost | Fits headless? | Fits with VS Code? | Speed |
-|---|---|---|---|---|
-| **apple-llm** (Apple FM ~3B) | ~860 MB (reclaimable) | Yes, plenty | Yes, plenty | ~55 w/s |
-| **Ollama llama3.2** (3B) | 2.3 GB (pinned) | Yes | Yes, tight | ~35 w/s |
-| **Ollama llama3.1** (8B) | 4.3 GB (pinned) | Yes | Causes swap pressure | ~17 w/s |
-
-The 8B model is the best quality option, but on a 16GB Mac mini it's impractical during development sessions — 4.3GB pinned leaves almost nothing for spikes. In headless mode it fits, but runs 3x slower than apple-llm due to memory pressure.
-
-apple-llm is the sweet spot: good-enough quality for routine cron jobs, fastest inference, and minimal memory impact. For the occasional task that needs higher quality (precise classification, clean JSON), route it to a cloud API instead of paying the memory tax of a local 8B model.
+apple-llm is the sweet spot for routine cron jobs: good-enough quality, fastest inference, and minimal memory impact. For tasks that need higher quality (precise classification, clean JSON), route them to a cloud API or a larger local model if memory allows.
 
 ## Security
 
