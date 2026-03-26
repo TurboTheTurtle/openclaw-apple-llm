@@ -8,6 +8,7 @@ import {
   type ProviderAuthResult,
   type ProviderCatalogContext,
 } from "openclaw/plugin-sdk/plugin-entry";
+import { upsertAuthProfileWithLock } from "openclaw/plugin-sdk/agent-runtime";
 import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 import type {
   AssistantMessage,
@@ -18,22 +19,18 @@ import type {
 } from "@mariozechner/pi-ai";
 
 const PROVIDER_ID = "apple";
-const MODEL_ID = "apple/foundation";
+const MODEL_ID = "foundation";
 const DUMMY_API_KEY = "apple-local";
+const APPLE_API: Api = "apple-foundation" as Api;
 
 function resolveAppleLlmBinary(): string | null {
-  // 1. Check PATH
   try {
     const result = execFileSync("which", ["apple-llm"], {
       encoding: "utf-8",
       timeout: 3000,
     }).trim();
     if (result) return result;
-  } catch {
-    // not in PATH
-  }
-
-  // 2. Known fallback locations
+  } catch {}
   const fallbacks = [
     `${process.env.HOME}/bin/apple-llm`,
     "/usr/local/bin/apple-llm",
@@ -44,11 +41,8 @@ function resolveAppleLlmBinary(): string | null {
         execFileSync("test", ["-x", p], { timeout: 1000 });
         return p;
       }
-    } catch {
-      // not executable or doesn't exist
-    }
+    } catch {}
   }
-
   return null;
 }
 
@@ -57,8 +51,6 @@ function extractPromptFromContext(context: Context): {
   system: string;
 } {
   const system = context.systemPrompt ?? "";
-
-  // Find the last user message
   let prompt = "";
   for (let i = context.messages.length - 1; i >= 0; i--) {
     const msg = context.messages[i];
@@ -74,7 +66,6 @@ function extractPromptFromContext(context: Context): {
       break;
     }
   }
-
   return { prompt, system };
 }
 
@@ -97,13 +88,80 @@ function buildAssistantMessage(
   return {
     role: "assistant",
     content: [{ type: "text", text }],
-    api: "openai-completions",
+    api: APPLE_API,
     provider: PROVIDER_ID,
-    model: "apple-foundation",
+    model: MODEL_ID,
     usage: makeEmptyUsage(),
     stopReason,
     ...(errorMessage ? { errorMessage } : {}),
     timestamp: Date.now(),
+  };
+}
+
+function createAppleLlmStreamFn(binaryPath: string) {
+  return (
+    _model: Model<Api>,
+    context: Context,
+    options?: SimpleStreamOptions,
+  ) => {
+    const stream = createAssistantMessageEventStream();
+
+    const { prompt, system } = extractPromptFromContext(context);
+    const payload = JSON.stringify({
+      prompt,
+      system,
+      max_tokens: options?.maxTokens ?? 4096,
+      temperature: options?.temperature ?? 0.7,
+    });
+
+    const child = spawn(binaryPath, ["--json", "--no-stream"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+
+    child.on("error", (err) => {
+      const msg = buildAssistantMessage("", "error", `apple-llm spawn error: ${err.message}`);
+      stream.push({ type: "start", partial: msg });
+      stream.end(msg);
+    });
+
+    child.on("close", (code) => {
+      if (code !== 0) {
+        const errText = stderr.trim() || `apple-llm exited with code ${code}`;
+        const msg = buildAssistantMessage("", "error", errText);
+        stream.push({ type: "start", partial: msg });
+        stream.end(msg);
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout.trim()) as {
+          content: string;
+          model: string;
+          tokens_used: number | null;
+        };
+        const responseText = result.content ?? "";
+        const partial = buildAssistantMessage(responseText, "stop");
+        stream.push({ type: "start", partial });
+        stream.push({ type: "text_start", contentIndex: 0, partial });
+        stream.push({ type: "text_end", contentIndex: 0, content: responseText, partial });
+        stream.end(partial);
+      } catch (parseErr) {
+        const errMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+        const msg = buildAssistantMessage("", "error",
+          `Failed to parse apple-llm output: ${errMsg}\nRaw: ${stdout.slice(0, 200)}`);
+        stream.push({ type: "start", partial: msg });
+        stream.end(msg);
+      }
+    });
+
+    child.stdin.write(payload);
+    child.stdin.end();
+    return stream;
   };
 }
 
@@ -112,6 +170,17 @@ export default definePluginEntry({
   name: "Apple Foundation Models Provider",
   description: "Local Apple Foundation Models provider via apple-llm CLI",
   register(api: OpenClawPluginApi) {
+    const binaryPath = resolveAppleLlmBinary();
+    if (!binaryPath) return;
+
+    // Auto-provision auth credential
+    upsertAuthProfileWithLock({
+      profileId: "apple:default",
+      credential: { type: "api_key", provider: PROVIDER_ID, key: DUMMY_API_KEY },
+    }).catch(() => {});
+
+    const appleLlmStreamFn = createAppleLlmStreamFn(binaryPath);
+
     api.registerProvider({
       id: PROVIDER_ID,
       label: "Apple Foundation Models",
@@ -121,154 +190,55 @@ export default definePluginEntry({
           label: "Apple Foundation Models (local)",
           hint: "Local on-device model via apple-llm CLI",
           kind: "custom",
-          run: async (_ctx: ProviderAuthContext): Promise<ProviderAuthResult> => {
-            return {
-              profiles: [
-                {
-                  profileId: "apple:default",
-                  credential: {
-                    type: "api_key",
-                    provider: PROVIDER_ID,
-                    key: DUMMY_API_KEY,
-                  },
-                },
-              ],
-            };
-          },
-          runNonInteractive: async (
-            _ctx: ProviderAuthMethodNonInteractiveContext,
-          ) => {
-            return null;
-          },
+          run: async (_ctx: ProviderAuthContext): Promise<ProviderAuthResult> => ({
+            profiles: [{
+              profileId: "apple:default",
+              credential: { type: "api_key", provider: PROVIDER_ID, key: DUMMY_API_KEY },
+            }],
+          }),
+          runNonInteractive: async (_ctx: ProviderAuthMethodNonInteractiveContext) => null,
         },
       ],
       catalog: {
         order: "late",
         run: async (_ctx: ProviderCatalogContext) => {
-          const binaryPath = resolveAppleLlmBinary();
-          if (!binaryPath) {
-            return null;
-          }
-
+          if (!resolveAppleLlmBinary()) return null;
           return {
             provider: {
-              baseUrl: "http://localhost:0",
+              baseUrl: "http://127.0.0.1:1",
               apiKey: DUMMY_API_KEY,
-              api: "openai-completions" as const,
-              models: [
-                {
-                  id: MODEL_ID,
-                  name: "Apple Foundation Model (~3B)",
-                  api: "openai-completions" as const,
-                  reasoning: false,
-                  input: ["text"] as Array<"text" | "image">,
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                  contextWindow: 4096,
-                  maxTokens: 4096,
-                },
-              ],
+              api: APPLE_API,
+              models: [{
+                id: MODEL_ID,
+                name: "Apple Foundation Model (~3B)",
+                api: APPLE_API,
+                reasoning: false,
+                input: ["text"] as Array<"text" | "image">,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 4096,
+                maxTokens: 4096,
+              }],
             },
           };
         },
       },
+      resolveDynamicModel: (ctx) => {
+        if (ctx.provider !== PROVIDER_ID || ctx.modelId !== MODEL_ID) return null;
+        return {
+          id: MODEL_ID,
+          name: "Apple Foundation Model (~3B)",
+          api: APPLE_API,
+          provider: PROVIDER_ID,
+          baseUrl: "http://127.0.0.1:1",
+          reasoning: false,
+          input: ["text"] as Array<"text" | "image">,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 4096,
+          maxTokens: 4096,
+        } as Model<Api>;
+      },
       wrapStreamFn: (_ctx) => {
-        const binaryPath = resolveAppleLlmBinary();
-        if (!binaryPath) {
-          return null;
-        }
-
-        return (
-          model: Model<Api>,
-          context: Context,
-          options?: SimpleStreamOptions,
-        ) => {
-          const stream = createAssistantMessageEventStream();
-
-          const { prompt, system } = extractPromptFromContext(context);
-
-          const payload = JSON.stringify({
-            prompt,
-            system,
-            max_tokens: options?.maxTokens ?? 4096,
-            temperature: options?.temperature ?? 0.7,
-          });
-
-          const child = spawn(binaryPath, ["--json", "--no-stream"], {
-            stdio: ["pipe", "pipe", "pipe"],
-          });
-
-          let stdout = "";
-          let stderr = "";
-
-          child.stdout.on("data", (chunk: Buffer) => {
-            stdout += chunk.toString();
-          });
-
-          child.stderr.on("data", (chunk: Buffer) => {
-            stderr += chunk.toString();
-          });
-
-          child.on("error", (err) => {
-            const msg = buildAssistantMessage(
-              "",
-              "error",
-              `apple-llm spawn error: ${err.message}`,
-            );
-            stream.push({ type: "start", partial: msg });
-            stream.end(msg);
-          });
-
-          child.on("close", (code) => {
-            if (code !== 0) {
-              const errText = stderr.trim() || `apple-llm exited with code ${code}`;
-              const msg = buildAssistantMessage("", "error", errText);
-              stream.push({ type: "start", partial: msg });
-              stream.end(msg);
-              return;
-            }
-
-            try {
-              const result = JSON.parse(stdout.trim()) as {
-                content: string;
-                model: string;
-                tokens_used: number | null;
-              };
-
-              const responseText = result.content ?? "";
-              const partial = buildAssistantMessage(responseText, "stop");
-
-              stream.push({ type: "start", partial });
-              stream.push({
-                type: "text_start",
-                contentIndex: 0,
-                partial,
-              });
-              stream.push({
-                type: "text_end",
-                contentIndex: 0,
-                content: responseText,
-                partial,
-              });
-              stream.end(partial);
-            } catch (parseErr) {
-              const errMsg =
-                parseErr instanceof Error ? parseErr.message : String(parseErr);
-              const msg = buildAssistantMessage(
-                "",
-                "error",
-                `Failed to parse apple-llm output: ${errMsg}\nRaw: ${stdout.slice(0, 200)}`,
-              );
-              stream.push({ type: "start", partial: msg });
-              stream.end(msg);
-            }
-          });
-
-          // Write payload to stdin and close
-          child.stdin.write(payload);
-          child.stdin.end();
-
-          return stream;
-        };
+        return appleLlmStreamFn;
       },
     });
   },
