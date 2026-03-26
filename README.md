@@ -110,63 +110,94 @@ apple-llm --prompt "" 2>/dev/null || echo "failed"
 
 ## Benchmarks
 
-Head-to-head comparison on Mac mini M4, macOS 26.4. Ollama running `llama3.2:3b` (same ~3B parameter class). All times wall-clock, median of 3 runs.
+Head-to-head comparison on Mac mini M4 (16GB), macOS 26.4. All Ollama models use default quantization (Q4_0/Q4_K_M). All times wall-clock, median of 3 runs. Nine models tested across three size classes: 3B, 7-9B, and 12-14B.
 
 ### Latency & Throughput
 
-| Test | apple-llm (~3B) | Ollama llama3.2 (3B) | Ollama llama3.1 (8B) |
-|---|---|---|---|
-| **Short prompt** ("What is 2+2?") | **0.30s** | 0.42s | 0.61s |
-| **Medium response** (~120 words) | **2.93s** | 4.84s | 14.08s |
-| **Longer response** (~350 words) | **5.65s** | 9.70s | 18.90s |
-| **Throughput** (longer response) | **~55 w/s** | ~35 w/s | ~17 w/s |
+| Model | Short prompt | Medium (~150 words) | Longer (~350 words) | Throughput |
+|---|---|---|---|---|
+| **apple-llm** (Apple FM ~3B) | **0.30s** | **2.93s** | **5.65s** | **~55 w/s** |
+| Ollama llama3.2 (3B) | 0.42s | 4.84s | 9.70s | ~35 w/s |
+| Ollama phi3 (3.8B) | 2.01s | 16.16s | 13.07s | ~28 w/s |
+| Ollama qwen2.5 (7B) | 0.62s | 12.99s | 19.06s | ~18 w/s |
+| Ollama llama3.1 (8B) | 0.61s | 14.08s | 18.90s | ~17 w/s |
+| Ollama mistral (7B) | 0.71s | 19.17s | 24.23s | ~16 w/s |
+| Ollama gemma2 (9B) | 0.71s | 13.78s | 21.54s | ~14 w/s |
+| Ollama mistral-nemo (12B) | 1.73s | 16.53s | 26.69s | ~12 w/s |
+| Ollama phi3 (14B) | 9.58s | 30.90s | 45.81s | ~9 w/s |
 
-The 8B model is 3x slower than apple-llm on this machine due to memory pressure (4.3GB model on a 16GB system with ~5-8GB available).
+apple-llm remains the fastest by a wide margin thanks to Neural Engine acceleration. In the 7-9B class, qwen2.5 and llama3.1 are the fastest; gemma2:9b is slightly slower but produces more concise output. The 12-14B models are 2-5x slower than apple-llm and offer diminishing returns on this hardware.
 
 ### Memory
 
-These two tools manage memory very differently. Per-process RSS (`ps`) doesn't tell the full story for apple-llm because the model runs on the Neural Engine, outside any userspace process. To get a real comparison, we measured **total system memory delta** via `vm_stat` before, during, and after inference.
-
-| | apple-llm | Ollama (llama3.2:3b) |
+| Model | Process RSS | Headroom on 16GB (after ~6GB baseline) |
 |---|---|---|
-| **System memory delta (cold start)** | ~860 MB | ~2,330 MB |
-| **System memory delta (warm)** | ~20-250 MB | ~0 MB (already loaded) |
-| **Residual after inference** | ~800 MB (OS-managed, reclaimable) | ~2,300 MB (pinned until idle timeout) |
-| **Per-process RSS** | ~19 MB (CLI wrapper only) | ~2,300 MB (model weights in process) |
+| **apple-llm** (Apple FM ~3B) | ~19 MB (+ ~860 MB system, reclaimable) | ~9.1 GB |
+| Ollama llama3.2 (3B) | ~2,300 MB | ~7.7 GB |
+| Ollama phi3 (3.8B) | ~3,100 MB | ~6.9 GB |
+| Ollama llama3.1 (8B) | ~4,300 MB | ~5.7 GB |
+| Ollama mistral (7B) | ~4,700 MB | ~5.3 GB |
+| Ollama qwen2.5 (7B) | ~4,800 MB | ~5.2 GB |
+| Ollama gemma2 (9B) | ~6,800 MB | ~3.2 GB |
+| Ollama mistral-nemo (12B) | ~7,300 MB | ~2.7 GB |
+| Ollama phi3 (14B) | ~8,000 MB | ~2.0 GB |
 
 **How apple-llm works under the hood:** The CLI process (~19MB) is just an IPC client. It sends the prompt to Apple's Neural Engine daemons (`aned`, `aneuserd`), which are always-on system services (~11MB combined). The ~3B model weights are loaded by the OS onto the Neural Engine hardware — they don't appear in any process's RSS, but they do consume ~860MB of system memory on first load.
 
 **Key differences from Ollama:**
-- Apple's model memory is **OS-managed and reclaimable** — the system can evict it under memory pressure. Ollama's 2.3GB is pinned in userspace until its idle timeout (default 5 minutes).
+- Apple's model memory is **OS-managed and reclaimable** — the system can evict it under memory pressure. Ollama's memory is pinned in userspace until its idle timeout (default 5 minutes).
 - The apple-llm CLI process **exits immediately** after inference. Ollama's server stays resident.
-- Total system cost is roughly **2.5-3x less** than Ollama for a comparable 3B model, with the added benefit that the OS can reclaim the memory when needed.
+- The 7B class models (mistral, qwen2.5, llama3.1) use 4.3-4.8GB — roughly **5x more** than apple-llm's system footprint and non-reclaimable.
 
 ### Model Quality
 
-We ran identical prompts through three models for tasks typical of OpenClaw cron jobs:
+We ran 6 identical prompts through all models for tasks typical of OpenClaw cron jobs: summarize JSON, extract action items, classify an error log, format a Slack message, extract JSON from structured data, and reason about disk usage.
 
-| Test | apple-llm (Apple FM ~3B) | Ollama llama3.2 (3B) | Ollama llama3.1 (8B) |
-|---|---|---|---|
-| **Summarize JSON** | Correct, listed all services | Correct, grouped by status | Correct |
-| **Extract action items** | Got 2 of 3 | Got 3 of 3 | Got 3 of 3 |
-| **Classify error log** | "network" (wrong) | "application" (wrong) | **"database" (correct)** |
-| **Format for Slack** | Clean one-liner | Verbose with hashtags | Clean one-liner |
-| **JSON extraction** | Both correct, but markdown-wrapped | Missed one container | **Both correct, clean JSON** |
-| **Disk usage reasoning** | Wrong ("not concerned" at 90%) | Correct | Correct |
+| Test | apple-llm (~3B) | llama3.2 (3B) | phi3 (3.8B) | mistral (7B) | qwen2.5 (7B) | gemma2 (9B) | llama3.1 (8B) | mistral-nemo (12B) | phi3 (14B) |
+|---|---|---|---|---|---|---|---|---|---|
+| **Summarize JSON** | Correct | Correct | Correct | Correct | Correct | Correct | Correct | Correct | Correct |
+| **Extract action items** | 2 of 3 | 3 of 3 | 3 of 3 | 2 of 3 | 3 of 3 | 2 of 3 | 3 of 3 | 3 of 3 | 3 of 3 |
+| **Classify error** | "network" ✗ | "application" ✗ | **"database" ✓** | **"database" ✓** | "network" ✗ | **"database" ✓** | **"database" ✓** | **"database" ✓** | **"database" ✓** |
+| **Format for Slack** | Clean ✓ | Verbose ✗ | Inaccurate ✗ | Clean ✓ | Garbled ✗ | Clean ✓ | Clean ✓ | Clean ✓ | Wrong count ✗ |
+| **JSON extraction** | Correct, md-wrapped | Missed one | Correct, md-wrapped | **Clean JSON** ✓ | **Clean JSON** ✓ | **Clean JSON** ✓ | **Clean JSON** ✓ | **Clean JSON** ✓ | Verbose ✗ |
+| **Disk reasoning** | Wrong ✗ | Correct ✓ | Correct ✓ | Correct ✓ | Correct ✓ | Correct ✓ | Correct ✓ | Correct ✓ | Wrong ✗ |
+| **Score** | 3/6 | 3/6 | 4/6 | 5/6 | 4/6 | **5/6** | **5/6** | **6/6** | 3/6 |
 
-**Verdict:** The 8B model is noticeably better — nails classification, produces clean JSON, and follows instructions more precisely. The two 3B models (Apple FM and llama3.2) are roughly comparable, trading wins depending on the task. For OpenClaw cron jobs, apple-llm handles summarization and formatting well; tasks requiring precise structured output or classification would benefit from a larger model.
+**Key findings:**
+- **mistral-nemo:12b scored 6/6** — the only model to ace every task. Correct classification, clean JSON, concise Slack formatting, and sound reasoning.
+- **gemma2:9b, mistral:7b, and llama3.1:8b tied at 5/6** — all nail classification and produce clean JSON. gemma2 stands out for concise, well-structured output.
+- **phi3:14b was a disappointment at 3/6** — despite being the largest model, it hallucinated disk usage numbers, gave wrong Slack stats ("2/3" instead of "3/4"), and was verbose. Worst value: slowest, most RAM, mediocre quality.
+- The 3B class (apple-llm and llama3.2) reliably handles summarization and formatting but struggles with classification and structured output.
 
-### Why apple-llm on a Mac mini
+### Choosing a Local Fallback Model
 
-Real-world memory budget on a 16GB Mac mini M4 running OpenClaw, Plex, Scrypted, AdGuard, and other home lab services: baseline usage is ~6GB, leaving **~8GB available** for inference.
+apple-llm handles the easy stuff — summarization, formatting, simple Q&A — at 55 w/s with near-zero memory cost. But for tasks that need precise classification, clean JSON, or careful reasoning, you want a fallback model. Here's what to pair it with on a 16GB Mac mini:
 
-| Model | Memory cost | Headroom left | Speed |
-|---|---|---|---|
-| **apple-llm** (Apple FM ~3B) | ~860 MB (reclaimable) | ~7 GB | ~55 w/s |
-| **Ollama llama3.2** (3B) | 2.3 GB (pinned) | ~5.7 GB | ~35 w/s |
-| **Ollama llama3.1** (8B) | 4.3 GB (pinned) | ~3.7 GB | ~17 w/s |
+| Recommendation | Model | Why | Memory | Speed |
+|---|---|---|---|---|
+| **Best quality** | mistral-nemo:12b | Only model to score 6/6. Nails every task type. | 7.3 GB | ~12 w/s |
+| **Best balance** ⭐ | gemma2:9b | 5/6 quality, concise output, good structured data. Best quality-per-GB. | 6.8 GB | ~14 w/s |
+| **Budget pick** | mistral:7b | 5/6 quality, lower memory, clean JSON output. | 4.7 GB | ~16 w/s |
 
-apple-llm is the sweet spot for routine cron jobs: good-enough quality, fastest inference, and minimal memory impact. For tasks that need higher quality (precise classification, clean JSON), route them to a cloud API or a larger local model if memory allows.
+**Our recommendation: gemma2:9b** as the default fallback. It scores the same as llama3.1:8b on quality but produces more concise, better-structured output. On a 16GB Mac mini with typical home lab services (~6GB baseline), it leaves ~3.2GB of headroom — tight but workable if Ollama isn't running 24/7.
+
+If memory is tight (running alongside heavy services), **mistral:7b** gives the same 5/6 quality with 2GB less RAM. If you can spare the memory and want the best possible quality, **mistral-nemo:12b** is the only model that aced every test.
+
+**Skip phi3:14b** — it's the slowest, hungriest model tested and scored worse than models half its size.
+
+### OpenClaw Routing Strategy
+
+For OpenClaw deployments, we recommend a two-tier approach:
+
+```
+Tier 1 (apple-llm): summarization, formatting, simple Q&A
+  → Fast (~55 w/s), free, zero idle cost
+
+Tier 2 (gemma2:9b via Ollama): classification, JSON extraction, reasoning
+  → Higher quality, load on demand
+```
+
+Start Ollama only when Tier 2 tasks arrive, stop after idle timeout. This keeps the Mac mini's memory free for other services most of the time while still having a high-quality local model available when needed.
 
 ## Security
 
