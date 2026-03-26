@@ -45,11 +45,10 @@ function readShimState(): { port: number; token: string; pid: number } | null {
     if (!existsSync(PORT_FILE)) return null;
     const data = JSON.parse(readFileSync(PORT_FILE, "utf-8"));
     if (!data.port || !data.token || !data.pid) return null;
-    // Check if PID is still alive
     try {
       process.kill(data.pid, 0);
     } catch {
-      return null; // process is dead
+      return null;
     }
     return data;
   } catch {
@@ -57,42 +56,38 @@ function readShimState(): { port: number; token: string; pid: number } | null {
   }
 }
 
-function ensureShimRunning(binaryPath: string): { port: number; token: string } {
-  // Check if shim is already running
+function spawnShim(binaryPath: string, token: string): void {
+  mkdirSync(SHIM_DIR, { recursive: true });
+  const shimScript = join(__dirname, "shim.mjs");
+  const child = spawn(
+    process.execPath,
+    [shimScript, binaryPath, token, PORT_FILE],
+    { detached: true, stdio: "ignore" },
+  );
+  child.unref();
+}
+
+/** Non-blocking: returns existing shim state or spawns a new one and polls async. */
+async function ensureShimRunning(binaryPath: string): Promise<{ port: number; token: string }> {
   const existing = readShimState();
   if (existing) {
     return { port: existing.port, token: existing.token };
   }
 
-  // Ensure state directory exists
-  mkdirSync(SHIM_DIR, { recursive: true });
-
   const token = randomBytes(32).toString("hex");
-  const shimScript = join(__dirname, "shim.mjs");
+  spawnShim(binaryPath, token);
 
-  // Spawn detached shim process
-  const child = spawn(
-    process.execPath,
-    [shimScript, binaryPath, token, PORT_FILE],
-    {
-      detached: true,
-      stdio: "ignore",
-    },
-  );
-  child.unref();
-
-  // Wait for the shim to write its port file (up to 3 seconds)
-  const deadline = Date.now() + 3000;
+  // Poll for port file with async sleep (does NOT block the event loop)
+  const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
     const state = readShimState();
     if (state) {
       return { port: state.port, token: state.token };
     }
-    // Busy-wait 50ms
-    execFileSync("sleep", ["0.05"]);
   }
 
-  throw new Error("apple-llm shim failed to start within 3 seconds");
+  throw new Error("apple-llm shim failed to start within 5 seconds");
 }
 
 export default definePluginEntry({
@@ -115,7 +110,7 @@ export default definePluginEntry({
           run: async (
             _ctx: ProviderAuthContext,
           ): Promise<ProviderAuthResult> => {
-            const shim = ensureShimRunning(binaryPath);
+            const shim = await ensureShimRunning(binaryPath);
             return {
               profiles: [
                 {
@@ -134,24 +129,14 @@ export default definePluginEntry({
           ) => null,
         },
       ],
-      prepareRuntimeAuth: async (ctx) => {
-        if (ctx.provider !== PROVIDER_ID) return null;
-        // Restart shim if it died between runs (e.g. idle timeout)
-        const shim = ensureShimRunning(binaryPath);
-        return {
-          apiKey: shim.token,
-          baseUrl: `http://127.0.0.1:${shim.port}`,
-        };
-      },
       catalog: {
         order: "late",
         run: async (_ctx: ProviderCatalogContext) => {
           if (!resolveAppleLlmBinary()) return null;
 
-          const shim = ensureShimRunning(binaryPath);
+          const shim = await ensureShimRunning(binaryPath);
           const baseUrl = `http://127.0.0.1:${shim.port}`;
 
-          // Store auth credential with the shim's token
           await upsertAuthProfileWithLock({
             profileId: "apple:default",
             credential: {
