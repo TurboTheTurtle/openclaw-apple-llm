@@ -31,8 +31,8 @@ Apple's Foundation Models run a ~3B parameter model on the Neural Engine with OS
 ## Install
 
 ```bash
-git clone https://github.com/TurboTheTurtle/openclaw-apple-llm.git
-cd openclaw-apple-llm
+git clone https://github.com/TurboTheTurtle/apple-intelligence-cli.git
+cd apple-intelligence-cli
 make install    # builds release + symlinks to /usr/local/bin
 ```
 
