@@ -124,28 +124,21 @@ Head-to-head comparison on Mac mini M4, macOS 26.4. Ollama running `llama3.2:3b`
 
 ### Memory
 
-These two tools manage memory very differently, so a direct comparison requires context.
+These two tools manage memory very differently. Per-process RSS (`ps`) doesn't tell the full story for apple-llm because the model runs on the Neural Engine, outside any userspace process. To get a real comparison, we measured **total system memory delta** via `vm_stat` before, during, and after inference.
 
-**Ollama** loads the full model weights into userspace RAM where they're visible to `ps`:
-
-| Process | RSS | Notes |
+| | apple-llm | Ollama (llama3.2:3b) |
 |---|---|---|
-| `ollama` (server) | ~93 MB | Always running |
-| `ollama` (runner) | ~2,200 MB | Model weights in RAM, stays resident until timeout |
-| **Total** | **~2,300 MB** | **Measurable, stays resident even when idle** |
+| **System memory delta (cold start)** | ~860 MB | ~2,330 MB |
+| **System memory delta (warm)** | ~20-250 MB | ~0 MB (already loaded) |
+| **Residual after inference** | ~800 MB (OS-managed, reclaimable) | ~2,300 MB (pinned until idle timeout) |
+| **Per-process RSS** | ~19 MB (CLI wrapper only) | ~2,300 MB (model weights in process) |
 
-**apple-llm** is an IPC client — inference runs on the Neural Engine via Apple's system daemons:
+**How apple-llm works under the hood:** The CLI process (~19MB) is just an IPC client. It sends the prompt to Apple's Neural Engine daemons (`aned`, `aneuserd`), which are always-on system services (~11MB combined). The ~3B model weights are loaded by the OS onto the Neural Engine hardware — they don't appear in any process's RSS, but they do consume ~860MB of system memory on first load.
 
-| Process | RSS | Notes |
-|---|---|---|
-| `apple-llm` | ~19 MB | CLI process, exits after inference |
-| `aned` | ~8 MB | ANE daemon (always running on macOS) |
-| `aneuserd` | ~3 MB | ANE user-space interface (always running) |
-| **Total visible** | **~30 MB** | **But this is not the full picture** |
-
-**Important caveat:** Apple's ~3B parameter model weights are loaded onto the Neural Engine hardware and managed by the OS kernel. They don't appear in any process's RSS, and there is no public API to measure their true memory footprint. The 30MB figure above is only what's visible in userspace — the actual system cost is unknown and not directly comparable to Ollama's transparent 2.3GB.
-
-What we *can* say: the ANE daemons run regardless of whether `apple-llm` is installed, and the CLI process exits immediately after inference. Ollama's 2.3GB stays resident until an idle timeout (default 5 minutes).
+**Key differences from Ollama:**
+- Apple's model memory is **OS-managed and reclaimable** — the system can evict it under memory pressure. Ollama's 2.3GB is pinned in userspace until its idle timeout (default 5 minutes).
+- The apple-llm CLI process **exits immediately** after inference. Ollama's server stays resident.
+- Total system cost is roughly **2.5-3x less** than Ollama for a comparable 3B model, with the added benefit that the OS can reclaim the memory when needed.
 
 ## Security
 
