@@ -134,6 +134,15 @@ export default definePluginEntry({
           ) => null,
         },
       ],
+      prepareRuntimeAuth: async (ctx) => {
+        if (ctx.provider !== PROVIDER_ID) return null;
+        // Restart shim if it died between runs (e.g. idle timeout)
+        const shim = ensureShimRunning(binaryPath);
+        return {
+          apiKey: shim.token,
+          baseUrl: `http://127.0.0.1:${shim.port}`,
+        };
+      },
       catalog: {
         order: "late",
         run: async (_ctx: ProviderCatalogContext) => {

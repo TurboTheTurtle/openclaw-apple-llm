@@ -127,11 +127,12 @@ const server = createServer((req, res) => {
   });
 });
 
-// Auto-shutdown after 10 minutes of inactivity
-let idleTimer = setTimeout(() => { cleanup(); process.exit(0); }, 600_000);
+// Auto-shutdown after 4 hours of inactivity (outlives any cron interval)
+const IDLE_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+let idleTimer = setTimeout(() => { cleanup(); process.exit(0); }, IDLE_TIMEOUT_MS);
 server.on("request", () => {
   clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => { cleanup(); process.exit(0); }, 600_000);
+  idleTimer = setTimeout(() => { cleanup(); process.exit(0); }, IDLE_TIMEOUT_MS);
 });
 
 function cleanup() {
