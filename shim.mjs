@@ -112,7 +112,11 @@ const server = createServer((req, res) => {
             message: { role: "assistant", content: result.content || "" },
             finish_reason: "stop",
           }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          usage: {
+            prompt_tokens: Math.ceil(body.length / 4),
+            completion_tokens: Math.ceil((result.content || "").length / 4),
+            total_tokens: Math.ceil(body.length / 4) + Math.ceil((result.content || "").length / 4),
+          },
         }));
       } catch {
         res.writeHead(502, { "Content-Type": "application/json" });
@@ -143,7 +147,24 @@ function cleanup() {
 process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 process.on("SIGINT", () => { cleanup(); process.exit(0); });
 
-server.listen(0, "127.0.0.1", () => {
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE" && tryPort !== 0) {
+    // Fixed port is taken — fall back to random
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      writeFileSync(PORT_FILE, JSON.stringify({ port, token: TOKEN, pid: process.pid }));
+    });
+  } else {
+    process.exit(1);
+  }
+});
+
+// Use a fixed port derived from the token to avoid port drift across restarts.
+// If the fixed port is taken (old shim still dying), fall back to random.
+const FIXED_PORT = 18787;
+const tryPort = process.argv[5] === "--random-port" ? 0 : FIXED_PORT;
+server.listen(tryPort, "127.0.0.1", () => {
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
   // Write port + token to file so the plugin can read it

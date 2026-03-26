@@ -1,7 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { randomBytes } from "node:crypto";
 import {
   definePluginEntry,
   type OpenClawPluginApi,
@@ -14,6 +13,10 @@ import { upsertAuthProfileWithLock } from "openclaw/plugin-sdk/agent-runtime";
 
 const PROVIDER_ID = "apple";
 const MODEL_ID = "foundation";
+const SHIM_PORT = 18787;
+// Static token — must be identical across all shim restarts so the auth
+// profile stored at gateway startup matches the shim spawned during catalog.
+const STATIC_TOKEN = "apple-llm-local-provider-token-v1";
 const SHIM_DIR = join(process.env.HOME ?? "/tmp", ".openclaw", "apple-llm-shim");
 const PORT_FILE = join(SHIM_DIR, "shim.json");
 
@@ -74,8 +77,7 @@ async function ensureShimRunning(binaryPath: string): Promise<{ port: number; to
     return { port: existing.port, token: existing.token };
   }
 
-  const token = randomBytes(32).toString("hex");
-  spawnShim(binaryPath, token);
+  spawnShim(binaryPath, STATIC_TOKEN);
 
   // Poll for port file with async sleep (does NOT block the event loop)
   const deadline = Date.now() + 5000;
@@ -97,6 +99,13 @@ export default definePluginEntry({
   register(api: OpenClawPluginApi) {
     const binaryPath = resolveAppleLlmBinary();
     if (!binaryPath) return;
+
+    // Pre-seed auth credential synchronously so the gateway's AuthStorage
+    // loads it at startup, before catalog discovery spawns the shim.
+    upsertAuthProfileWithLock({
+      profileId: "apple:default",
+      credential: { type: "api_key", provider: PROVIDER_ID, key: STATIC_TOKEN },
+    }).catch(() => {});
 
     api.registerProvider({
       id: PROVIDER_ID,
@@ -135,6 +144,7 @@ export default definePluginEntry({
           if (!resolveAppleLlmBinary()) return null;
 
           const shim = await ensureShimRunning(binaryPath);
+          // Use actual shim port (usually SHIM_PORT unless EADDRINUSE fallback)
           const baseUrl = `http://127.0.0.1:${shim.port}`;
 
           await upsertAuthProfileWithLock({
@@ -160,7 +170,7 @@ export default definePluginEntry({
                   input: ["text"] as Array<"text" | "image">,
                   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
                   contextWindow: 262144,
-                  maxTokens: 4096,
+                  maxTokens: 32768,
                 },
               ],
             },
