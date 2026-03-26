@@ -112,6 +112,8 @@ apple-llm --prompt "" 2>/dev/null || echo "failed"
 
 Tested on Mac mini M4, macOS 26.4. All times are wall-clock, averaged over 3 runs.
 
+### Latency & Throughput
+
 | Metric | Result |
 |---|---|
 | **Cold start + short prompt** | ~0.33s (warm), ~0.64s (first run) |
@@ -119,11 +121,21 @@ Tested on Mac mini M4, macOS 26.4. All times are wall-clock, averaged over 3 run
 | **Medium response (~120 words)** | ~2.8s (~42 words/s) |
 | **Longer response (~300 words)** | ~5.6s (~58 words/s) |
 | **JSON mode (short prompt)** | ~0.28s |
-| **Peak RSS (single inference)** | ~19 MB |
-| **Peak RSS (longer inference)** | ~19 MB |
-| **Idle memory** | 0 MB (process exits) |
 
-For comparison, Ollama typically keeps 3-4GB+ resident in RAM even when idle. apple-llm's process-per-request model means zero memory cost between calls — Apple's OS-level Neural Engine handles model lifecycle.
+### Memory
+
+The `apple-llm` process itself is lightweight (~19MB RSS) — it's just an IPC client. The actual inference runs in Apple's system daemons that manage the Neural Engine:
+
+| Process | RSS | Role |
+|---|---|---|
+| `apple-llm` | ~19 MB | CLI process (Swift runtime + IPC stubs) |
+| `aned` | ~38 MB | ANE daemon — hosts model execution |
+| `ANECompilerService` | ~5 MB | Compiles model graphs for Neural Engine |
+| `aneuserd` | ~4 MB | User-space ANE interface |
+
+The ~3B parameter model weights are loaded directly onto the Neural Engine hardware and managed by the OS kernel — they don't appear in any process's RSS. Apple's ANE daemons (~47MB combined) run regardless of whether `apple-llm` is active, so the marginal cost of running inference is effectively just the 19MB CLI process, which exits immediately after.
+
+For comparison, Ollama keeps the full model weights resident in userspace RAM (3-4GB+ for a comparable model) even when idle.
 
 ## Security
 
