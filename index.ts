@@ -1,5 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import {
   definePluginEntry,
   type OpenClawPluginApi,
@@ -9,19 +11,11 @@ import {
   type ProviderCatalogContext,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { upsertAuthProfileWithLock } from "openclaw/plugin-sdk/agent-runtime";
-import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
-import type {
-  AssistantMessage,
-  Context,
-  Model,
-  Api,
-  SimpleStreamOptions,
-} from "@mariozechner/pi-ai";
 
 const PROVIDER_ID = "apple";
 const MODEL_ID = "foundation";
-const DUMMY_API_KEY = "apple-local";
-const APPLE_API: Api = "apple-foundation" as Api;
+const SHIM_DIR = join(process.env.HOME ?? "/tmp", ".openclaw", "apple-llm-shim");
+const PORT_FILE = join(SHIM_DIR, "shim.json");
 
 function resolveAppleLlmBinary(): string | null {
   try {
@@ -46,123 +40,59 @@ function resolveAppleLlmBinary(): string | null {
   return null;
 }
 
-function extractPromptFromContext(context: Context): {
-  prompt: string;
-  system: string;
-} {
-  const system = context.systemPrompt ?? "";
-  let prompt = "";
-  for (let i = context.messages.length - 1; i >= 0; i--) {
-    const msg = context.messages[i];
-    if (msg.role === "user") {
-      if (typeof msg.content === "string") {
-        prompt = msg.content;
-      } else if (Array.isArray(msg.content)) {
-        prompt = msg.content
-          .filter((c): c is { type: "text"; text: string } => c.type === "text")
-          .map((c) => c.text)
-          .join("\n");
-      }
-      break;
+function readShimState(): { port: number; token: string; pid: number } | null {
+  try {
+    if (!existsSync(PORT_FILE)) return null;
+    const data = JSON.parse(readFileSync(PORT_FILE, "utf-8"));
+    if (!data.port || !data.token || !data.pid) return null;
+    // Check if PID is still alive
+    try {
+      process.kill(data.pid, 0);
+    } catch {
+      return null; // process is dead
     }
+    return data;
+  } catch {
+    return null;
   }
-  return { prompt, system };
 }
 
-function makeEmptyUsage() {
-  return {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: 0,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-  };
-}
+function ensureShimRunning(binaryPath: string): { port: number; token: string } {
+  // Check if shim is already running
+  const existing = readShimState();
+  if (existing) {
+    return { port: existing.port, token: existing.token };
+  }
 
-function buildAssistantMessage(
-  text: string,
-  stopReason: "stop" | "error",
-  errorMessage?: string,
-): AssistantMessage {
-  return {
-    role: "assistant",
-    content: [{ type: "text", text }],
-    api: APPLE_API,
-    provider: PROVIDER_ID,
-    model: MODEL_ID,
-    usage: makeEmptyUsage(),
-    stopReason,
-    ...(errorMessage ? { errorMessage } : {}),
-    timestamp: Date.now(),
-  };
-}
+  // Ensure state directory exists
+  mkdirSync(SHIM_DIR, { recursive: true });
 
-function createAppleLlmStreamFn(binaryPath: string) {
-  return (
-    _model: Model<Api>,
-    context: Context,
-    options?: SimpleStreamOptions,
-  ) => {
-    const stream = createAssistantMessageEventStream();
+  const token = randomBytes(32).toString("hex");
+  const shimScript = join(__dirname, "shim.mjs");
 
-    const { prompt, system } = extractPromptFromContext(context);
-    const payload = JSON.stringify({
-      prompt,
-      system,
-      max_tokens: options?.maxTokens ?? 4096,
-      temperature: options?.temperature ?? 0.7,
-    });
+  // Spawn detached shim process
+  const child = spawn(
+    process.execPath,
+    [shimScript, binaryPath, token, PORT_FILE],
+    {
+      detached: true,
+      stdio: "ignore",
+    },
+  );
+  child.unref();
 
-    const child = spawn(binaryPath, ["--json", "--no-stream"], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+  // Wait for the shim to write its port file (up to 3 seconds)
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const state = readShimState();
+    if (state) {
+      return { port: state.port, token: state.token };
+    }
+    // Busy-wait 50ms
+    execFileSync("sleep", ["0.05"]);
+  }
 
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-
-    child.on("error", (err) => {
-      const msg = buildAssistantMessage("", "error", `apple-llm spawn error: ${err.message}`);
-      stream.push({ type: "start", partial: msg });
-      stream.end(msg);
-    });
-
-    child.on("close", (code) => {
-      if (code !== 0) {
-        const errText = stderr.trim() || `apple-llm exited with code ${code}`;
-        const msg = buildAssistantMessage("", "error", errText);
-        stream.push({ type: "start", partial: msg });
-        stream.end(msg);
-        return;
-      }
-      try {
-        const result = JSON.parse(stdout.trim()) as {
-          content: string;
-          model: string;
-          tokens_used: number | null;
-        };
-        const responseText = result.content ?? "";
-        const partial = buildAssistantMessage(responseText, "stop");
-        stream.push({ type: "start", partial });
-        stream.push({ type: "text_start", contentIndex: 0, partial });
-        stream.push({ type: "text_end", contentIndex: 0, content: responseText, partial });
-        stream.end(partial);
-      } catch (parseErr) {
-        const errMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-        const msg = buildAssistantMessage("", "error",
-          `Failed to parse apple-llm output: ${errMsg}\nRaw: ${stdout.slice(0, 200)}`);
-        stream.push({ type: "start", partial: msg });
-        stream.end(msg);
-      }
-    });
-
-    child.stdin.write(payload);
-    child.stdin.end();
-    return stream;
-  };
+  throw new Error("apple-llm shim failed to start within 3 seconds");
 }
 
 export default definePluginEntry({
@@ -173,14 +103,6 @@ export default definePluginEntry({
     const binaryPath = resolveAppleLlmBinary();
     if (!binaryPath) return;
 
-    // Auto-provision auth credential
-    upsertAuthProfileWithLock({
-      profileId: "apple:default",
-      credential: { type: "api_key", provider: PROVIDER_ID, key: DUMMY_API_KEY },
-    }).catch(() => {});
-
-    const appleLlmStreamFn = createAppleLlmStreamFn(binaryPath);
-
     api.registerProvider({
       id: PROVIDER_ID,
       label: "Apple Foundation Models",
@@ -190,55 +112,66 @@ export default definePluginEntry({
           label: "Apple Foundation Models (local)",
           hint: "Local on-device model via apple-llm CLI",
           kind: "custom",
-          run: async (_ctx: ProviderAuthContext): Promise<ProviderAuthResult> => ({
-            profiles: [{
-              profileId: "apple:default",
-              credential: { type: "api_key", provider: PROVIDER_ID, key: DUMMY_API_KEY },
-            }],
-          }),
-          runNonInteractive: async (_ctx: ProviderAuthMethodNonInteractiveContext) => null,
+          run: async (
+            _ctx: ProviderAuthContext,
+          ): Promise<ProviderAuthResult> => {
+            const shim = ensureShimRunning(binaryPath);
+            return {
+              profiles: [
+                {
+                  profileId: "apple:default",
+                  credential: {
+                    type: "api_key",
+                    provider: PROVIDER_ID,
+                    key: shim.token,
+                  },
+                },
+              ],
+            };
+          },
+          runNonInteractive: async (
+            _ctx: ProviderAuthMethodNonInteractiveContext,
+          ) => null,
         },
       ],
       catalog: {
         order: "late",
         run: async (_ctx: ProviderCatalogContext) => {
           if (!resolveAppleLlmBinary()) return null;
+
+          const shim = ensureShimRunning(binaryPath);
+          const baseUrl = `http://127.0.0.1:${shim.port}`;
+
+          // Store auth credential with the shim's token
+          await upsertAuthProfileWithLock({
+            profileId: "apple:default",
+            credential: {
+              type: "api_key",
+              provider: PROVIDER_ID,
+              key: shim.token,
+            },
+          }).catch(() => {});
+
           return {
             provider: {
-              baseUrl: "http://127.0.0.1:1",
-              apiKey: DUMMY_API_KEY,
-              api: APPLE_API,
-              models: [{
-                id: MODEL_ID,
-                name: "Apple Foundation Model (~3B)",
-                api: APPLE_API,
-                reasoning: false,
-                input: ["text"] as Array<"text" | "image">,
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                contextWindow: 4096,
-                maxTokens: 4096,
-              }],
+              baseUrl,
+              apiKey: shim.token,
+              api: "openai-completions" as const,
+              models: [
+                {
+                  id: MODEL_ID,
+                  name: "Apple Foundation Model (~3B)",
+                  api: "openai-completions" as const,
+                  reasoning: false,
+                  input: ["text"] as Array<"text" | "image">,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                  contextWindow: 262144,
+                  maxTokens: 4096,
+                },
+              ],
             },
           };
         },
-      },
-      resolveDynamicModel: (ctx) => {
-        if (ctx.provider !== PROVIDER_ID || ctx.modelId !== MODEL_ID) return null;
-        return {
-          id: MODEL_ID,
-          name: "Apple Foundation Model (~3B)",
-          api: APPLE_API,
-          provider: PROVIDER_ID,
-          baseUrl: "http://127.0.0.1:1",
-          reasoning: false,
-          input: ["text"] as Array<"text" | "image">,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 4096,
-          maxTokens: 4096,
-        } as Model<Api>;
-      },
-      wrapStreamFn: (_ctx) => {
-        return appleLlmStreamFn;
       },
     });
   },
